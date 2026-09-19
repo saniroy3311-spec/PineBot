@@ -1,0 +1,20 @@
+[Unit]
+Description=Pinescript Bot — EMA 20/50
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/pinescript-bot
+EnvironmentFile=/opt/pinescript-bot/.env
+ExecStart=/opt/pinescript-bot/.venv/bin/python /opt/pinescript-bot/main.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pinescript-bot
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
