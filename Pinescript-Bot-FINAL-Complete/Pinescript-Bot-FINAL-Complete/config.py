@@ -1,9 +1,9 @@
 """Canonical configuration for Pinescript Bot.
 
-Source of truth: the user supplied Pinescript Bot Pine Script, with the
-requested EMA inputs changed to Fast=20 and Trend=50.  Strategy parameters in
-this file intentionally match that Pine script unless an environment variable
-explicitly overrides them.
+Source of truth: the current user-supplied Shiva Sniper Pine Script.
+The current strategy uses Fast EMA=50, Trend EMA=200 and bar-close state
+updates (calc_on_every_tick=false). Strategy parameters in this file match that
+script unless an environment variable explicitly overrides them.
 
 For strict parity, keep PINE_PARITY_MODE=true and do not add execution buffers.
 Live fills can still differ from TradingView because TradingView uses a broker
@@ -65,9 +65,9 @@ PINE_SLIPPAGE_TICKS = _i("PINE_SLIPPAGE_TICKS", 10)
 PINE_POINT_VALUE = _f("PINE_POINT_VALUE", 0.001)
 PINE_ORDER_QTY = _f("PINE_ORDER_QTY", 30.0)
 
-# Requested EMA 20/50 configuration
-EMA_FAST_LEN = _i("EMA_FAST_LEN", 20)
-EMA_TREND_LEN = _i("EMA_TREND_LEN", 50)
+# Current supplied Pine configuration: EMA 50 / 200
+EMA_FAST_LEN = _i("EMA_FAST_LEN", 50)
+EMA_TREND_LEN = _i("EMA_TREND_LEN", 200)
 ATR_LEN = _i("ATR_LEN", 14)
 DI_LEN = _i("DI_LEN", 14)
 ADX_SMOOTH = _i("ADX_SMOOTH", 14)
@@ -96,9 +96,25 @@ MAX_SL_MULT = _f("MAX_SL_MULT", 2.0)
 MAX_SL_POINTS = _f("MAX_SL_POINTS", 1500.0)
 BE_MULT = _f("BE_MULT", 1.0)
 
-# (trigger ATR, trail_points ATR multiplier, trail_offset ATR multiplier)
-# TradingView interprets trail_points and trail_offset as TICKS; conversion to
-# price distance is multiplier * ATR * PINE_MINTICK.
+# (trigger ATR, legacy trail_points ATR multiplier, trail_offset ATR multiplier)
+# BIG-MOVE-FIX:
+# - Correct mode (default): triggerMult is the activation distance in ATR PRICE
+#   units and offMult is the trailing gap in ATR PRICE units. This is the
+#   intuitive meaning of the inputs and prevents the pre-Stage-1 micro trail.
+# - Legacy mode: reproduces the old Pine mistake where ATR-price values were
+#   passed directly to trail_points/trail_offset, which TradingView interprets
+#   as TICKS (therefore multiplying by PINE_MINTICK again).
+TRAIL_LEGACY_TV_TICK_SEMANTICS = _b("TRAIL_LEGACY_TV_TICK_SEMANTICS", False)
+TRAIL_STAGE_UPDATE_MODE = os.environ.get("TRAIL_STAGE_UPDATE_MODE", "bar_close").strip().lower()
+BREAKEVEN_UPDATE_MODE = os.environ.get("BREAKEVEN_UPDATE_MODE", "bar_close").strip().lower()
+MAX_SL_EVAL_MODE = os.environ.get("MAX_SL_EVAL_MODE", "bar_close").strip().lower()
+if TRAIL_STAGE_UPDATE_MODE not in {"bar_close", "tick"}:
+    raise ValueError("TRAIL_STAGE_UPDATE_MODE must be bar_close or tick")
+if BREAKEVEN_UPDATE_MODE not in {"bar_close", "tick"}:
+    raise ValueError("BREAKEVEN_UPDATE_MODE must be bar_close or tick")
+if MAX_SL_EVAL_MODE not in {"bar_close", "tick"}:
+    raise ValueError("MAX_SL_EVAL_MODE must be bar_close or tick")
+
 TRAIL_STAGES = [
     (_f("TRAIL1_TRIGGER", 1.0), _f("TRAIL1_PTS", 0.70), _f("TRAIL1_OFF", 0.55)),
     (_f("TRAIL2_TRIGGER", 2.0), _f("TRAIL2_PTS", 0.55), _f("TRAIL2_OFF", 0.45)),
@@ -121,10 +137,13 @@ TRAIL_LOOP_SEC = _f("TRAIL_LOOP_SEC", 0.25)
 TRAIL_EXIT_FROM_DELTA_WS = _b("TRAIL_EXIT_FROM_DELTA_WS", True)
 TRAIL_FIRE_SL_ON_CANDLE_EXTREME = _b("TRAIL_FIRE_SL_ON_CANDLE_EXTREME", False)
 
-# Live execution behavior. With LIVE_TICK_RISK_ENGINE=true, stage upgrades,
-# breakeven, Max-SL, initial SL, TP, and trailing exits are all evaluated on
-# running ticks after a position is open. Entries remain confirmed-bar signals.
-TP_HARD_EXIT = _b("TP_HARD_EXIT", True)
+# Live execution behavior. LIVE_TICK_RISK_ENGINE keeps protective price orders
+# responsive to live ticks. Stage, breakeven, and Max-SL timing are independently
+# selectable above; defaults are bar_close to match the supplied Pine script.
+# Initial SL / TP / an already-armed trail still react to live prices for safety.
+TP_HARD_EXIT = _b("TP_HARD_EXIT", True)  # master switch
+TREND_HARD_TP_ENABLED = _b("TREND_HARD_TP_ENABLED", True)
+RANGE_HARD_TP_ENABLED = _b("RANGE_HARD_TP_ENABLED", True)
 BAR_CLOSE_SL_EVAL = _b("BAR_CLOSE_SL_EVAL", False)
 TIME_EXIT_MINUTES = _i("TIME_EXIT_MINUTES", 0)
 TRAIL_SL_PRE_FIRE_BUFFER = _f("TRAIL_SL_PRE_FIRE_BUFFER", 0.0)
