@@ -11,8 +11,8 @@ EFFECT: the legacy bot was replacing the initial SL (e.g. 500 pts away) with a t
 SL just 320 pts from entry the instant price moved 0.01 pts favorable.
 Any normal intrabar noise could then hit this tight SL for a loss
 while Pine's trail wasn't even armed yet.
-LIVE-TICK MODE | Stage upgrades and breakeven are evaluated on every live tick.
-The bot no longer waits for a 30-minute close to ratchet S1→S5 or activate BE.
+BIG-MOVE-FIX | Stage upgrades and breakeven default to confirmed 30-minute
+bar closes, matching the supplied Pine. Protective SL/TP/trail fills stay live.
 FIX-4 | Initial SL update every bar (MEDIUM — trailing behind Pine)
 KEPT: on_bar_close() updates current_sl from live ATR each bar when trail
 not yet armed — matches Pine's strategy.exit(stop=) recalculation.
@@ -79,12 +79,13 @@ trail_sl = best_price - O
 Exit when current_price <= trail_sl
 STAGE UPGRADES (live-tick mode)
 ──────────────────────────────────────────────────────────────────────────
-Pinescript Bot upgrades trailStage as soon as a live tick satisfies profitDist >= atr * triggerMult.
-When stage upgrades, trail_sl recomputes immediately from existing best_price.
+Pinescript Bot defaults to upgrading trailStage on confirmed bar close when
+profitDist >= atr * triggerMult. Tick upgrades can be re-enabled by config.
 best_price does NOT reset on stage upgrade.
 BREAKEVEN (live-tick mode)
 ──────────────────────────────────────────────────────────────────────────
-Pinescript Bot: if profitDist > atr * beMult on a live tick → SL floor = entryPrice immediately.
+Pinescript Bot defaults to activating breakeven only when confirmed bar-close
+profitDist > atr * beMult. Tick activation can be re-enabled by config.
 Once BE fires, trail continues but SL can never go worse than entry.
 ════════════════════════════════════════════════════════════════════════════
 """
@@ -105,9 +106,15 @@ from config import (
     TRAIL_SL_CONFIRM_TICKS,
     BAR_CLOSE_SL_EVAL,
     TP_HARD_EXIT,
+    TREND_HARD_TP_ENABLED,
+    RANGE_HARD_TP_ENABLED,
     MAX_EXIT_SLIPPAGE_ATR_PCT,
     PINE_PARITY_MODE,
     LIVE_TICK_RISK_ENGINE,
+    TRAIL_LEGACY_TV_TICK_SEMANTICS,
+    TRAIL_STAGE_UPDATE_MODE,
+    BREAKEVEN_UPDATE_MODE,
+    MAX_SL_EVAL_MODE,
 )
 from risk.calculator import RiskLevels, TrailState
 
@@ -186,23 +193,26 @@ BAR_PERIOD_MS = _tf_to_ms(CANDLE_TIMEFRAME)
 
 # ─── Pine trail engine helpers ─────────────────────────────────────────────────
 def _trail_pts(stage: int, atr: float) -> float:
-    """
-    Activation distance = how far price must move in profit direction before
-    the trail arms.  Pine: trail_points = atr * pts_mult * PINE_MINTICK.
+    """Activation distance in PRICE units.
+
+    Correct mode: stage trigger * ATR. This means Stage 1 really cannot arm
+    before +1 ATR (with the default inputs). Legacy mode reproduces the old
+    Pine behavior where ATR-price values were passed as tick counts.
     """
     idx = max(stage - 1, 0)
-    _, pts_mult, _ = TRAIL_STAGES[idx]
-    return atr * pts_mult * PINE_MINTICK
+    trigger_mult, pts_mult, _ = TRAIL_STAGES[idx]
+    if TRAIL_LEGACY_TV_TICK_SEMANTICS:
+        return atr * pts_mult * PINE_MINTICK
+    return atr * trigger_mult
 
 def _trail_off(stage: int, atr: float) -> float:
-    """
-    Offset distance = gap between best_price and trail_sl.
-    Pine: trail_offset = atr * off_mult * PINE_MINTICK.
-    Optionally floored at atr * TRAIL_OFFSET_FLOOR_MULT.
+    """Trailing gap in PRICE units.
+
+    Correct mode: ATR * off_mult. Legacy mode: ATR * off_mult * mintick.
     """
     idx = max(stage - 1, 0)
     _, _, off_mult = TRAIL_STAGES[idx]
-    raw   = atr * off_mult * PINE_MINTICK
+    raw = (atr * off_mult * PINE_MINTICK) if TRAIL_LEGACY_TV_TICK_SEMANTICS else (atr * off_mult)
     floor = atr * TRAIL_OFFSET_FLOOR_MULT
     return max(raw, floor)
 
@@ -239,6 +249,12 @@ def _upgrade_stage(current_stage: int, profit_dist: float, atr: float) -> int:
                 new_stage = candidate
             break
     return new_stage
+
+def _hard_tp_enabled(risk: RiskLevels) -> bool:
+    """Return whether this trade should use a hard take-profit."""
+    if not TP_HARD_EXIT:
+        return False
+    return TREND_HARD_TP_ENABLED if risk.is_trend else RANGE_HARD_TP_ENABLED
 
 # ─── TrailMonitor ──────────────────────────────────────────────────────────────
 class TrailMonitor:
@@ -513,11 +529,11 @@ class TrailMonitor:
         self._static_orders_active = True
 
         # ── 3. Stage upgrade ────────────────────────────────────────────────
-        # Live-tick mode owns stage upgrades inside _evaluate_tick(). The
-        # bar-close path remains only as a compatibility fallback.
+        # Default is BAR CLOSE to match calc_on_every_tick=false in the supplied
+        # Pine. Tick mode remains available explicitly for experimentation.
         close_profit = (bar_close - entry_price) if is_long else (entry_price - bar_close)
         new_stage = _upgrade_stage(state.stage, close_profit, atr)
-        if (not LIVE_TICK_RISK_ENGINE) and new_stage > state.stage:
+        if TRAIL_STAGE_UPDATE_MODE == "bar_close" and new_stage > state.stage:
             logger.info(
                 f"[TRAIL] Stage {state.stage} → {new_stage} at bar close |  "
                 f"profit={close_profit:.2f} atr={atr:.2f} "
@@ -529,7 +545,7 @@ class TrailMonitor:
                 self._apply_trail_sl(state, risk, new_trail_sl, is_long, source="stage_upgrade_bar")
             else:
                 # Trail not yet armed — log the new activation price so next ticks
-                # use the upgraded stage's trail_pts to arm (closer to entry = arms sooner)
+                # use the upgraded stage's configured activation profile
                 new_act = _activation_price(entry_price, state.stage, atr, is_long)
                 logger.info(
                     f"[TRAIL] Stage upgrade pre-arm: new activation_price={new_act:.2f}  "
@@ -537,8 +553,8 @@ class TrailMonitor:
                     f"trail_off={_trail_off(state.stage, atr):.2f} "
                 )
 
-        # ── 4. Breakeven check (BAR-CLOSE ONLY) ─────────────────────────────
-        if (not LIVE_TICK_RISK_ENGINE) and (not state.be_done) and close_profit > atr * BE_MULT:
+        # ── 4. Breakeven check ──────────────────────────────────────────────
+        if BREAKEVEN_UPDATE_MODE == "bar_close" and (not state.be_done) and close_profit > atr * BE_MULT:
             self._activate_be(state, risk, is_long, atr, source="bar_close")
 
         # ── 5 & 6. Bar extreme: advance best_price or check trail arm ────────
@@ -576,7 +592,7 @@ class TrailMonitor:
         # ── 7. Close-only Max SL check ───────────────────────────────────────
         # Pine uses strategy.close_all() only when the CONFIRMED close crosses
         # the dynamic max-SL threshold. It is not an intrabar/tick stop.
-        if (not LIVE_TICK_RISK_ENGINE) and (not is_entry_bar) and (not state.max_sl_fired):
+        if MAX_SL_EVAL_MODE == "bar_close" and (not is_entry_bar) and (not state.max_sl_fired):
             max_thresh = min(atr * MAX_SL_MULT, MAX_SL_POINTS)
             max_hit = (bar_close <= entry_price - max_thresh) if is_long else (bar_close >= entry_price + max_thresh)
             if max_hit:
@@ -596,7 +612,7 @@ class TrailMonitor:
 
         # Supplied Pine uses strategy.exit(... limit=tp), so TP is a real exit.
         # The recovery bar-range path is disabled by default to avoid retroactive fills.
-        tp_hit = TP_HARD_EXIT and ((bar_high  >= risk.tp) if is_long else (bar_low   <= risk.tp))
+        tp_hit = _hard_tp_enabled(risk) and ((bar_high  >= risk.tp) if is_long else (bar_low   <= risk.tp))
         sl_hit = (bar_low   <= pre_trail_sl) if is_long else (bar_high  >= pre_trail_sl)
 
         if tp_hit or sl_hit:
@@ -894,31 +910,32 @@ class TrailMonitor:
         entry_price = risk.entry_price
         atr          = self._current_atr
 
-        # ── 0. Live-tick risk-state updates ──────────────────────────────────
+        # ── 0. Optional live-tick state updates ───────────────────────────────
+        # Protective stop/TP/trail checks remain live. Stage and BE state updates
+        # default to bar-close because the supplied Pine uses calc_on_every_tick=false.
         if LIVE_TICK_RISK_ENGINE:
             profit_dist = (price - entry_price) if is_long else (entry_price - price)
 
-            # Stage upgrades ratchet immediately on the running tick.
-            new_stage = _upgrade_stage(state.stage, profit_dist, atr)
-            if new_stage > state.stage:
-                old_stage = state.stage
-                state.stage = new_stage
-                logger.info(
-                    f"[TRAIL] Stage {old_stage} → {new_stage} LIVE | "
-                    f"price={price:.2f} profit={profit_dist:.2f} atr={atr:.2f}"
-                )
-                if getattr(state, "trail_armed", False) and state.best_price > 0:
-                    new_sl = _trail_sl_from_best(state.best_price, state.stage, atr, is_long)
-                    self._apply_trail_sl(state, risk, new_sl, is_long, source="stage_upgrade_tick")
+            if TRAIL_STAGE_UPDATE_MODE == "tick":
+                new_stage = _upgrade_stage(state.stage, profit_dist, atr)
+                if new_stage > state.stage:
+                    old_stage = state.stage
+                    state.stage = new_stage
+                    logger.info(
+                        f"[TRAIL] Stage {old_stage} → {new_stage} LIVE | "
+                        f"price={price:.2f} profit={profit_dist:.2f} atr={atr:.2f}"
+                    )
+                    if getattr(state, "trail_armed", False) and state.best_price > 0:
+                        new_sl = _trail_sl_from_best(state.best_price, state.stage, atr, is_long)
+                        self._apply_trail_sl(state, risk, new_sl, is_long, source="stage_upgrade_tick")
 
-            # Breakeven activates immediately when the live tick exceeds 1 ATR.
-            if (not state.be_done) and profit_dist > atr * BE_MULT:
+            if BREAKEVEN_UPDATE_MODE == "tick" and (not state.be_done) and profit_dist > atr * BE_MULT:
                 self._activate_be(state, risk, is_long, atr, source="live_tick")
 
         # ── 1. TP hit ─────────────────────────────────────────────────────────
         # Supplied Pine uses a hard limit TP. It becomes active only after
         # entryPrice exists and the script recalculates at the first post-fill close.
-        if TP_HARD_EXIT and self._static_orders_active:
+        if _hard_tp_enabled(risk) and self._static_orders_active:
             if is_long and price  >= risk.tp:
                 await self._fire_exit(risk.tp, "TP", source="tick")
                 return
@@ -963,7 +980,7 @@ class TrailMonitor:
                     return
 
                 # Max SL check — live tick in the requested execution model.
-                if LIVE_TICK_RISK_ENGINE and not state.max_sl_fired:
+                if LIVE_TICK_RISK_ENGINE and MAX_SL_EVAL_MODE == "tick" and not state.max_sl_fired:
                     max_thresh = min(atr * MAX_SL_MULT, MAX_SL_POINTS)
                     if is_long and price <= entry_price - max_thresh:
                         state.max_sl_fired = True
@@ -1009,7 +1026,7 @@ class TrailMonitor:
             if be_at_entry:
                 reason = "Breakeven SL"
             elif trail_improved:
-                reason = f"Trail SL (stage {state.stage})"
+                reason = f"Trail SL (stage {max(state.stage, 1)})"
             else:
                 reason = "Initial SL"
             # Fire at state.current_sl — this is the price TV's Exit label shows.
@@ -1019,7 +1036,7 @@ class TrailMonitor:
             return
 
         # ── 6. Max SL — live tick ───────────────────────────────────────────
-        if LIVE_TICK_RISK_ENGINE and not state.max_sl_fired:
+        if LIVE_TICK_RISK_ENGINE and MAX_SL_EVAL_MODE == "tick" and not state.max_sl_fired:
             max_thresh = min(atr * MAX_SL_MULT, MAX_SL_POINTS)
             if is_long and price <= entry_price - max_thresh:
                 state.max_sl_fired = True
@@ -1061,7 +1078,7 @@ class TrailMonitor:
 
         # ── 1. TP hit ─────────────────────────────────────────────────────────
         # FIX-TP-PARITY: gated behind TP_HARD_EXIT — see note above.
-        if TP_HARD_EXIT and self._static_orders_active:
+        if _hard_tp_enabled(risk) and self._static_orders_active:
             if is_long and price  >= risk.tp:
                 await self._fire_exit(risk.tp, "TP", source="tick")
                 return
@@ -1084,7 +1101,7 @@ class TrailMonitor:
             if be_at_entry:
                 reason = "Breakeven SL"
             elif trail_improved:
-                reason = f"Trail SL (stage {state.stage})"
+                reason = f"Trail SL (stage {max(state.stage, 1)})"
             else:
                 reason = "Initial SL"
             await self._fire_exit(price, reason, source="tick")
