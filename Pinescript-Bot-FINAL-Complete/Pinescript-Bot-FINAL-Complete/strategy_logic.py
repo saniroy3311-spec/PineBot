@@ -9,7 +9,7 @@ from typing import Optional
 
 from config import (
     TRAIL_STAGES, PINE_MINTICK, BE_MULT, MAX_SL_MULT, MAX_SL_POINTS,
-    COMMISSION_PCT, ALERT_QTY,
+    COMMISSION_PCT, ALERT_QTY, TRAIL_LEGACY_TV_TICK_SEMANTICS,
 )
 from indicators.engine import (
     compute, compute_full_series, evaluate as evaluate_entry,
@@ -19,10 +19,17 @@ from risk.calculator import RiskLevels, TrailState, calc_levels
 
 
 def get_trail_params(stage: int, atr: float) -> tuple[float, float]:
-    """Return activation and offset PRICE distances for the active Pine stage."""
+    """Return activation and trailing-offset PRICE distances.
+
+    Correct mode uses the stage trigger as the actual activation distance and
+    interprets the offset multiplier in ATR price units. Legacy mode reproduces
+    the old TradingView tick-unit behavior for audit/backward comparison.
+    """
     idx = max(stage - 1, 0)
-    _, pts_mult, off_mult = TRAIL_STAGES[idx]
-    return atr * pts_mult * PINE_MINTICK, atr * off_mult * PINE_MINTICK
+    trigger_mult, pts_mult, off_mult = TRAIL_STAGES[idx]
+    if TRAIL_LEGACY_TV_TICK_SEMANTICS:
+        return atr * pts_mult * PINE_MINTICK, atr * off_mult * PINE_MINTICK
+    return atr * trigger_mult, atr * off_mult
 
 
 def upgrade_trail_stage(current_stage: int, close_profit_dist: float, atr: float) -> int:
@@ -45,9 +52,8 @@ def compute_trail_sl(
 ) -> Optional[float]:
     """Replicate strategy.exit(trail_points=, trail_offset=) price distances.
 
-    Pine interprets trail_points and trail_offset as tick counts. The Pine code
-    passes ATR*multipliers to those parameters, so TradingView converts them to
-    price distance by multiplying by syminfo.mintick.
+    In corrected mode, activation is stageTrigger * ATR and the trail gap is
+    stageOffset * ATR. Legacy mode can reproduce the original tick-unit bug.
     """
     activation, offset = get_trail_params(stage, atr)
     if favorable_dist < activation:
