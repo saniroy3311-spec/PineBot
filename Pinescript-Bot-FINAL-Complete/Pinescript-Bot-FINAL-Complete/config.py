@@ -65,9 +65,9 @@ PINE_SLIPPAGE_TICKS = _i("PINE_SLIPPAGE_TICKS", 10)
 PINE_POINT_VALUE = _f("PINE_POINT_VALUE", 0.001)
 PINE_ORDER_QTY = _f("PINE_ORDER_QTY", 30.0)
 
-# Current supplied Pine configuration: EMA 50 / 200
-EMA_FAST_LEN = _i("EMA_FAST_LEN", 50)
-EMA_TREND_LEN = _i("EMA_TREND_LEN", 200)
+# Current supplied Pine configuration: EMA 20 / 50
+EMA_FAST_LEN = _i("EMA_FAST_LEN", 20)
+EMA_TREND_LEN = _i("EMA_TREND_LEN", 50)
 ATR_LEN = _i("ATR_LEN", 14)
 DI_LEN = _i("DI_LEN", 14)
 ADX_SMOOTH = _i("ADX_SMOOTH", 14)
