@@ -690,10 +690,10 @@ class TrailMonitor:
         else:
             await self._evaluate_tick(price, source=source)
 
-    # ── Delta mark price tick — no offset needed ──────────────────────────────
+    # ── Delta last-traded price tick — no offset needed ──────────────────────
     async def push_delta_tick(self, price: float) -> None:
         """
-        Accept a Delta Exchange mark price tick directly.
+        Accept a Delta Exchange last-traded price tick directly.
         No Binance offset arithmetic — feeds straight into _evaluate_tick().
 
         FIX-6: Delta IS the authoritative price source  (same as Pine uses).
@@ -866,8 +866,8 @@ class TrailMonitor:
                 price = await self._get_mark_price()
                 if price is None or price  <= 0:
                     continue
-                # REST poll uses Delta mark price — always full _evaluate_tick()
-                # FIX-8: tagged source="delta" — REST polls Delta mark price,
+                # REST poll prefers Delta last-traded price — always full _evaluate_tick()
+                # FIX-8: tagged source="delta" — REST polls Delta price,
                 # so these count toward the breach tick counter too.
                 await self._evaluate_tick(price, source="delta")
             except asyncio.CancelledError:
@@ -976,7 +976,10 @@ class TrailMonitor:
 
                 if not _skip_initial_sl and self._sl_confirmed(price, sl_level, is_long, source=source):
                     reason = "Breakeven SL" if state.be_done else "Initial SL"
-                    await self._fire_exit(price, reason, source="tick")
+                    # EXIT-PARITY-FIX: a Pine stop fills at the stop level in the
+                    # broker emulator. Paper mode should therefore receive the
+                    # calculated stop, not whichever tick happened to breach it.
+                    await self._fire_exit(state.current_sl, reason, source="tick")
                     return
 
                 # Max SL check — live tick in the requested execution model.
@@ -1104,7 +1107,8 @@ class TrailMonitor:
                 reason = f"Trail SL (stage {max(state.stage, 1)})"
             else:
                 reason = "Initial SL"
-            await self._fire_exit(price, reason, source="tick")
+            # EXIT-PARITY-FIX: use the calculated trailing-stop level.
+            await self._fire_exit(state.current_sl, reason, source="tick")
             return
 
         # ── 3. Max SL (entry bar exempt) ─────────────────────────────────────
@@ -1409,11 +1413,10 @@ class TrailMonitor:
             f"source={source} atr={self._current_atr:.2f} "
         )
 
-        try:
-            await self._order_mgr.cancel_all_orders()
-        except Exception as e:
-            logger.warning(f"[TRAIL] cancel_all_orders failed: {e}")
-
+        # EXIT-LATENCY-FIX: close the position BEFORE cancelling the emergency
+        # bracket/open orders. Cancelling first adds REST latency exactly when a
+        # fast reversal is hitting the trail. If the close fails, keeping the
+        # emergency bracket active is safer than removing protection first.
         is_long = self._risk.is_long if self._risk else True
 
         MAX_ATTEMPTS = 3
@@ -1441,8 +1444,16 @@ class TrailMonitor:
         if not success:
             logger.error(
                 f"[TRAIL] close_position FAILED after {MAX_ATTEMPTS} attempts  "
-                f"(last: {last_err}). ⚠️ MANUAL CHECK REQUIRED."
+                f"(last: {last_err}). ⚠️ MANUAL CHECK REQUIRED. "
+                f"Emergency bracket/orders were intentionally left in place."
             )
+        else:
+            # Position close was sent/confirmed; now remove any leftover
+            # emergency bracket or stale orders. Cleanup must not delay exit.
+            try:
+                await self._order_mgr.cancel_all_orders()
+            except Exception as e:
+                logger.warning(f"[TRAIL] post-exit cancel_all_orders failed: {e}")
 
         reported_price = actual_fill_price if actual_fill_price is not None else exit_price
         if actual_fill_price is not None and abs(actual_fill_price - exit_price)  > 1.0:
@@ -1486,13 +1497,17 @@ class TrailMonitor:
             ticker = await self._order_mgr.fetch_ticker()
             if ticker is None:
                 return None
-            mark = (
-                ticker.get("markPrice")
+            # EXIT-PARITY-FIX: TradingView's Delta candle/strategy is driven by
+            # traded prices. Prefer CCXT's last price for stop/trail decisions;
+            # use mark price only as a fallback when last is unavailable.
+            raw = (
+                ticker.get("last")
+                or (ticker.get("info") or {}).get("last_price")
+                or ticker.get("markPrice")
                 or (ticker.get("info") or {}).get("mark_price")
-                or ticker.get("last")
                 or 0.0
             )
-            price = float(mark) if mark else 0.0
+            price = float(raw) if raw else 0.0
             return price if price  > 0 else None
         except Exception as e:
             logger.warning(f"[TRAIL] _get_mark_price failed: {e}")
