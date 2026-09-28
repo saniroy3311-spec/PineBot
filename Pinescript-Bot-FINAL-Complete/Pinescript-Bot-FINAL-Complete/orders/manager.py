@@ -441,10 +441,21 @@ class OrderManager:
         logger.info(f"[OM] Closing position | mode={EXECUTION_MODE} side={side}  reason={reason}")
 
         if EXECUTION_MODE == "paper":
-            ticker = await self.fetch_ticker()
-            fill = float((ticker or {}).get("last") or (ticker or {}).get("markPrice") or expected_price or 0.0)
+            # EXIT-PARITY-FIX: paper mode must book the strategy-computed exit
+            # level (TP / SL / trailing stop), not a later REST ticker price.
+            # A later ticker can be hundreds of points away during a fast BTC
+            # reversal and makes paper P/L incomparable with Pine.
+            if expected_price is not None and float(expected_price) > 0:
+                fill = float(expected_price)
+                fill_source = "strategy_exit_level"
+            else:
+                ticker = await self.fetch_ticker()
+                fill = float((ticker or {}).get("last") or (ticker or {}).get("markPrice") or 0.0)
+                fill_source = "ticker_fallback"
+
             if fill <= 0:
-                raise RuntimeError("Paper exit could not obtain a live market price")
+                raise RuntimeError("Paper exit could not determine an exit price")
+
             qty = float((self._paper_position or {}).get("contracts") or ALERT_QTY)
             self._paper_seq += 1
             order = {
@@ -454,29 +465,15 @@ class OrderManager:
             }
             self._paper_position = None
             self._last_exit_order = dict(order)
-            logger.warning(f"[OM] PAPER exit filled @ {fill:.2f}; no exchange order was sent")
+            logger.warning(
+                f"[OM] PAPER exit filled @ {fill:.2f} "
+                f"(source={fill_source}, expected={expected_price}); no exchange order was sent"
+            )
             return order
-        
-        # FIX: Slippage check before closing
-        if expected_price and self._current_atr > 0:
-            try:
-                ticker = await self.fetch_ticker()
-                if ticker:
-                    current_price = float(ticker.get("last") or ticker.get("markPrice") or 0)
-                    if current_price > 0:
-                        slippage_pts = abs(current_price - expected_price)
-                        slippage_atr_pct = (slippage_pts / self._current_atr) * 100
-                        
-                        logger.info(f"[OM] Slippage check: {slippage_pts:.2f}pts ({slippage_atr_pct:.1f}% ATR)")
-                        
-                        if slippage_atr_pct > MAX_EXIT_SLIPPAGE_ATR_PCT:
-                            logger.critical(
-                                f"[OM] ⚠️ HIGH SLIPPAGE: {slippage_pts:.2f}pts ({slippage_atr_pct:.1f}% ATR) | "
-                                f"Expected: {expected_price}, Current: {current_price}"
-                            )
-            except Exception as e:
-                logger.warning(f"[OM] Slippage check failed: {e}")
-        
+
+        # LIVE: do not perform a pre-close ticker request. On a fast reversal,
+        # that extra REST round-trip delays the reduce-only market exit. Compare
+        # the actual fill with expected_price after the close instead.
         try:
             pos = await self.fetch_open_position()
             close_qty = float(pos.get("contracts", 0)) if pos else float(ALERT_QTY)
@@ -492,6 +489,22 @@ class OrderManager:
             fill = float(order.get("average") or order.get("price") or 0.0)
             self._last_exit_order = dict(order) if isinstance(order, dict) else {"raw": str(order)}
             logger.info(f"[OM] Position closed | id={order.get('id')}  fill={fill:.2f}")
+
+            if expected_price and fill > 0 and self._current_atr > 0:
+                slippage_pts = abs(fill - float(expected_price))
+                slippage_atr_pct = (slippage_pts / self._current_atr) * 100
+                logger.info(
+                    f"[OM] Exit slippage: {slippage_pts:.2f}pts "
+                    f"({slippage_atr_pct:.1f}% ATR) | "
+                    f"expected={float(expected_price):.2f} actual={fill:.2f}"
+                )
+                if slippage_atr_pct > MAX_EXIT_SLIPPAGE_ATR_PCT:
+                    logger.critical(
+                        f"[OM] ⚠️ HIGH EXIT SLIPPAGE: {slippage_pts:.2f}pts "
+                        f"({slippage_atr_pct:.1f}% ATR) | "
+                        f"Expected: {float(expected_price):.2f}, Fill: {fill:.2f}"
+                    )
+
             return order
         except ccxt.ExchangeError as exc:
             msg = str(exc).lower()
@@ -508,7 +521,7 @@ class OrderManager:
 
     # ── Price feed / Recovery metrics ──────────────────────────────────────────
     async def fetch_ticker(self) -> Optional[dict]:
-        """Fetch current asset quote mark data."""
+        """Fetch the current Delta ticker/quote data."""
         try:
             ticker = await _retry(lambda: self.exchange.fetch_ticker(SYMBOL))
             return ticker
