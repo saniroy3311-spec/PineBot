@@ -308,12 +308,16 @@ class CandleFeed:
                 if msg_type in ("ticker", "v2/ticker"):
                     data = msg.get("data") or msg
                     if data:
+                        # EXIT-PARITY-FIX: use last-traded price first so the
+                        # Python stop/trail is driven by the same kind of price
+                        # represented by TradingView's Delta candles. Mark price
+                        # remains a fallback only.
                         raw_price = (
-                            data.get("mark_price") or
                             data.get("last_price") or
                             data.get("close") or
                             data.get("c") or
                             data.get("p") or
+                            data.get("mark_price") or
                             0
                         )
                         try:
